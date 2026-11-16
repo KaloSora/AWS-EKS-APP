@@ -1,3 +1,255 @@
+// Jenkins Multibranch Pipeline. The eks_cicd module registers the aws-eks-app pod template.
+// Use a trusted SCM configuration for this job and restrict use of its release ServiceAccount.
+// Prerequisites for releases:
+// - cicd-build/jenkins-ecr-publisher with IRSA and push access to the existing ECR repository.
+//   The build namespace must admit the unprivileged Kaniko container running as UID 0.
+// - A Jenkins Username with password credential aws-eks-gitops (GitHub username and token).
+//   Restrict the token to AWS-EKS-GitOps with Contents and Pull requests write permissions.
+// - For GitOps, provide EKS-ready JSON templates in deploy/environments/dev/manifests/.
+//   Argo CD watches apps/<artifactId>/environments/dev/manifests on main after setup.
+//   Allow the workload's EKS node role to pull from the ECR repository.
 pipeline {
-  
+    agent {
+        kubernetes {
+            inheritFrom 'aws-eks-app'
+        }
+    }
+
+    options {
+        disableConcurrentBuilds()
+        disableRestartFromStage()
+        skipDefaultCheckout()
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    parameters {
+        string(name: 'ECR_ACCOUNT_ID', defaultValue: '', description: '12-digit AWS account ID of the private ECR registry')
+        string(name: 'ECR_REGION', defaultValue: 'ap-southeast-1', description: 'AWS Region of the private ECR registry')
+        string(name: 'ECR_REPOSITORY', defaultValue: 'aws-eks-app', description: 'Existing ECR repository name, including any path prefix')
+        booleanParam(name: 'UPDATE_GITOPS', defaultValue: true, description: 'Open a dev GitOps PR after publishing from main')
+    }
+
+    environment {
+        SOURCE_REPOSITORY = 'https://github.com/KaloSora/AWS-EKS-APP'
+        GITOPS_REPO = 'https://github.com/KaloSora/AWS-EKS-GitOps.git'
+        GITOPS_BASE_BRANCH = 'main'
+        GITOPS_SOURCE_MANIFESTS = 'deploy/environments/dev/manifests'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    def scmVars = checkout scm
+                    env.SOURCE_COMMIT = scmVars.GIT_COMMIT
+
+                    if (!fileExists('pom.xml')) {
+                        error('Add the application pom.xml and source code before running the Maven build.')
+                    }
+
+                    if (env.BRANCH_NAME == 'main' && !env.CHANGE_ID) {
+                        def account = params.ECR_ACCOUNT_ID.trim()
+                        def region = params.ECR_REGION.trim()
+                        def repository = params.ECR_REPOSITORY.trim()
+                        if (!(account ==~ /[0-9]{12}/)) {
+                            error('ECR_ACCOUNT_ID must contain exactly 12 digits.')
+                        }
+                        if (!(region ==~ /[a-z]{2}(-[a-z]+)+-[0-9]+/)) {
+                            error('ECR_REGION must be an AWS Region name.')
+                        }
+                        def pathComponent = '[a-z0-9]+((?:[.]|_{1,2}|-+)[a-z0-9]+)*'
+                        if (repository.length() < 2 || repository.length() > 256 ||
+                            !(repository ==~ "${pathComponent}(/${pathComponent})*")) {
+                            error('ECR_REPOSITORY must be a valid lowercase ECR repository name.')
+                        }
+                        if (!fileExists('Dockerfile')) {
+                            error('Add a Dockerfile before publishing to ECR.')
+                        }
+                        if (params.UPDATE_GITOPS && (!fileExists("${env.GITOPS_SOURCE_MANIFESTS}/deployment.json") ||
+                            !fileExists("${env.GITOPS_SOURCE_MANIFESTS}/service.json"))) {
+                            error("Add deployment.json and service.json under ${env.GITOPS_SOURCE_MANIFESTS} for GitOps.")
+                        }
+
+                        def domain = region.startsWith('cn-') ? 'amazonaws.com.cn' : 'amazonaws.com'
+                        env.ECR_REGISTRY = "${account}.dkr.ecr.${region}.${domain}"
+                        env.IMAGE_REPOSITORY = "${env.ECR_REGISTRY}/${repository}"
+                        env.IMAGE_TAG = "${env.SOURCE_COMMIT.take(12)}-${env.BUILD_NUMBER}"
+                        env.IMAGE_REF = "${env.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"
+                    }
+                }
+            }
+        }
+
+        stage('Maven Verify') {
+            steps {
+                container('maven') {
+                    sh '''#!/bin/sh
+set -eu
+mvn -B -ntp clean verify
+mkdir -p build
+mvn -B -ntp org.apache.maven.plugins:maven-help-plugin:3.5.1:evaluate -Dexpression=project.artifactId -Doutput=build/maven-artifact-id.txt
+mvn -B -ntp org.apache.maven.plugins:maven-help-plugin:3.5.1:evaluate -Dexpression=project.version -Doutput=build/maven-version.txt
+'''
+                }
+                script {
+                    env.ARTIFACT_ID = readFile('build/maven-artifact-id.txt').trim()
+                    env.MAVEN_VERSION = readFile('build/maven-version.txt').trim()
+                }
+                archiveArtifacts artifacts: 'target/*.jar,build/maven-*.txt', fingerprint: true
+            }
+        }
+
+        stage('Build and Push to ECR') {
+            when {
+                allOf {
+                    branch 'main'
+                    not { changeRequest() }
+                }
+            }
+            steps {
+                script {
+                    if (params.UPDATE_GITOPS && !(env.ARTIFACT_ID ==~ /[a-z]([a-z0-9-]{0,61}[a-z0-9])?/)) {
+                        error('The Maven artifactId must be a lowercase Kubernetes Service name for GitOps.')
+                    }
+                }
+                container(name: 'kaniko', shell: '/busybox/sh') {
+                    sh '''#!/busybox/sh
+set -eu
+: "${AWS_ROLE_ARN:?Configure IRSA on cicd-build/jenkins-ecr-publisher}"
+test -r "${AWS_WEB_IDENTITY_TOKEN_FILE:?Missing IRSA token file}"
+printf '{"credHelpers":{"%s":"ecr-login"}}\\n' "$ECR_REGISTRY" > /kaniko/.docker/config.json
+/kaniko/executor \\
+  --context "dir://$WORKSPACE" \\
+  --dockerfile "$WORKSPACE/Dockerfile" \\
+  --destination "$IMAGE_REF" \\
+  --label "org.opencontainers.image.title=$ARTIFACT_ID" \\
+  --label "org.opencontainers.image.version=$MAVEN_VERSION" \\
+  --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \\
+  --label "org.opencontainers.image.source=$SOURCE_REPOSITORY" \\
+  --digest-file "$WORKSPACE/build/image-digest.txt"
+'''
+                }
+                script {
+                    env.IMAGE_DIGEST = readFile('build/image-digest.txt').trim()
+                    if (!(env.IMAGE_DIGEST ==~ /sha256:[0-9a-f]{64}/)) {
+                        error('Kaniko did not produce a valid SHA-256 image digest.')
+                    }
+                    env.IMAGE_DIGEST_REF = "${env.IMAGE_REPOSITORY}@${env.IMAGE_DIGEST}"
+                    writeFile file: 'build/image-ref.txt', text: "${env.IMAGE_REF}\n${env.IMAGE_DIGEST_REF}\n"
+                    echo "Published ${env.IMAGE_REF} (${env.IMAGE_DIGEST})"
+                }
+                archiveArtifacts artifacts: 'build/image-digest.txt,build/image-ref.txt', fingerprint: true
+            }
+        }
+
+        stage('Open Dev GitOps PR') {
+            when {
+                allOf {
+                    branch 'main'
+                    not { changeRequest() }
+                    expression { params.UPDATE_GITOPS }
+                }
+            }
+            steps {
+                container('gitops') {
+                    withCredentials([gitUsernamePassword(credentialsId: 'aws-eks-gitops', gitToolName: 'Default')]) {
+                        sh '''#!/bin/sh
+set -eu
+export GIT_TERMINAL_PROMPT=0
+export RELEASE_BRANCH="ci/dev/$ARTIFACT_ID/$IMAGE_TAG"
+gitops_dir=$(mktemp -d)
+trap 'rm -rf "$gitops_dir"' EXIT
+git clone --depth 1 --branch "$GITOPS_BASE_BRANCH" "$GITOPS_REPO" "$gitops_dir"
+cd "$gitops_dir"
+git switch -c "$RELEASE_BRANCH"
+release_dir="apps/$ARTIFACT_ID/environments/dev"
+
+python3 - "$release_dir" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+artifact = os.environ["ARTIFACT_ID"]
+source = Path(os.environ["WORKSPACE"]) / os.environ["GITOPS_SOURCE_MANIFESTS"]
+release = Path(sys.argv[1])
+manifests = release / "manifests"
+
+deployment = json.loads((source / "deployment.json").read_text().replace("${ARTIFACT_ID}", artifact))
+service = json.loads((source / "service.json").read_text().replace("${ARTIFACT_ID}", artifact))
+for resource, kind in ((deployment, "Deployment"), (service, "Service")):
+    metadata = resource.get("metadata", {})
+    if resource.get("kind") != kind or metadata.get("name") != artifact:
+        raise SystemExit(f"{kind} must be named {artifact}")
+    if metadata.get("namespace", "dev") != "dev":
+        raise SystemExit(f"{kind} must target the dev namespace")
+
+containers = deployment["spec"]["template"]["spec"]["containers"]
+app_containers = [container for container in containers if container.get("name") == "app"]
+if len(app_containers) != 1:
+    raise SystemExit("Deployment must contain exactly one container named app")
+app_containers[0]["image"] = os.environ["IMAGE_DIGEST_REF"]
+
+manifests.mkdir(parents=True, exist_ok=True)
+for path, value in (
+    (manifests / "deployment.json", deployment),
+    (manifests / "service.json", service),
+    (release / "release.json", {
+        "artifactId": artifact,
+        "imageRepository": os.environ["IMAGE_REPOSITORY"],
+        "imageDigest": os.environ["IMAGE_DIGEST"],
+        "imageTag": os.environ["IMAGE_TAG"],
+        "sourceCommit": os.environ["SOURCE_COMMIT"],
+        "version": os.environ["MAVEN_VERSION"],
+    }),
+):
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\\n")
+PY
+
+git add -- "$release_dir/manifests/deployment.json" "$release_dir/manifests/service.json" "$release_dir/release.json"
+if git diff --cached --quiet; then
+    echo 'GitOps already contains this release.'
+    exit 0
+fi
+
+git -c user.name='Jenkins CI' -c user.email='jenkins-ci@users.noreply.github.com' commit -m "Deploy $ARTIFACT_ID $IMAGE_TAG to dev"
+git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+printf 'GitOps branch: %s/tree/%s\\n' "${GITOPS_REPO%.git}" "$RELEASE_BRANCH"
+
+python3 - <<'PY'
+import json
+import os
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+env = os.environ
+repo = env["GITOPS_REPO"].removeprefix("https://github.com/").removesuffix(".git")
+payload = {
+    "title": f"Deploy {env['ARTIFACT_ID']} {env['IMAGE_TAG']} to dev",
+    "head": env["RELEASE_BRANCH"],
+    "base": env["GITOPS_BASE_BRANCH"],
+    "body": "Image `{IMAGE_DIGEST_REF}`\\n\\nSource {SOURCE_REPOSITORY}/commit/{SOURCE_COMMIT}".format_map(env),
+}
+request = Request(
+    f"https://api.github.com/repos/{repo}/pulls",
+    data=json.dumps(payload).encode(),
+    headers={
+        "Authorization": f"Bearer {env['GIT_PASSWORD']}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+    },
+)
+try:
+    with urlopen(request, timeout=30) as response:
+        print(f"GitOps pull request: {json.load(response)['html_url']}")
+except HTTPError as exc:
+    raise SystemExit(f"GitHub returned HTTP {exc.code}. Open a PR from the GitOps branch shown above.")
+PY
+'''
+                    }
+                }
+            }
+        }
+    }
 }
